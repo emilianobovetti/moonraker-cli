@@ -1,7 +1,15 @@
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::ExecutableCommand;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::Stylize;
+use ratatui::text::{Span, Text};
+use ratatui::widgets::{List, ListDirection, ListState, Widget};
 use serde::Serialize;
 use serde_json::json;
-use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
+use std::{env, io};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
 
@@ -15,7 +23,8 @@ enum Error {
     JoinError(tokio::task::JoinError),
     SendError(mpsc::error::SendError<String>),
     IO(io::Error),
-    Env(String),
+    DisconnectedIOChannel,
+    DisconnectedNetworkChannel,
 }
 
 impl From<reqwest::Error> for Error {
@@ -45,35 +54,167 @@ struct MoonrakerRPC<'a> {
     params: Option<JSON>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+struct CommandInput<'a> {
+    prompt: &'a str,
+    input: String,
+}
 
-    if !stdin.is_terminal() {
-        return Err::<(), Error>(Error::Env(
-            "Input device must be a TTY in interactive mode".to_string(),
-        ));
+impl CommandInput<'_> {
+    const fn new() -> Self {
+        Self {
+            prompt: "> ",
+            input: String::new(),
+        }
     }
 
+    fn on_key_press(&mut self, event: KeyEvent) {
+        match event.code {
+            KeyCode::Char(ch) => self.input.push(ch),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.prompt.chars().count() + self.input.chars().count()
+    }
+
+    fn cursor_position(&self, area: Rect) -> Position {
+        let input_len = self.len() as u16;
+
+        Position::new(input_len % area.width, area.height)
+    }
+
+    fn lines_count(&self, area: Rect) -> u16 {
+        (self.len() as u16 / area.width) + 1
+    }
+}
+
+impl Widget for &CommandInput<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let width = area.width as usize;
+        let prompt_len = self.prompt.chars().count() as u16;
+        let mut line_area = Rect { height: 1, ..area };
+
+        Span::from(self.prompt).bold().render(
+            Rect {
+                width: prompt_len,
+                ..line_area
+            },
+            buf,
+        );
+
+        // TODO: unicode support
+        let mut chars = self.input.chars();
+
+        chars
+            .by_ref()
+            .take(width - self.prompt.len())
+            .collect::<String>()
+            .render(
+                Rect {
+                    x: prompt_len,
+                    ..line_area
+                },
+                buf,
+            );
+
+        loop {
+            let line = chars.by_ref().take(width).collect::<String>();
+
+            if line.is_empty() {
+                break;
+            }
+
+            line_area.y += 1;
+            line.render(line_area, buf);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let (io_tx, io_rx) = mpsc::channel::<String>(2);
     let (network_tx, mut network_rx) = mpsc::channel::<String>(2);
 
+    let mut terminal = ratatui::init();
+    let mut cmd = CommandInput::new();
+    let mut responses: Vec<String> = Vec::new();
+    let mut list_state = ListState::default();
+
+    std::io::stdout().execute(event::EnableMouseCapture)?;
+
     let io_thread = tokio::task::spawn_blocking(move || -> Result<(), Error> {
         loop {
-            stdout.write_all(b"> ")?;
-            stdout.flush()?;
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let layout = Layout::vertical([
+                    Constraint::Fill(1),
+                    Constraint::Length(cmd.lines_count(area)),
+                ]);
 
-            let mut buffer = String::new();
-            stdin.read_line(&mut buffer)?;
+                let [output_area, input_area] = layout.areas(area);
 
-            io_tx.blocking_send(buffer)?;
+                let lines: Vec<_> = responses
+                    .iter()
+                    .rev()
+                    .map(|resp| Text::raw(resp.as_str()))
+                    .collect();
 
-            network_rx
-                .blocking_recv()
-                .map(|resp| stdout.write_fmt(format_args!("{}\n", resp)))
-                .transpose()?;
+                let list = List::new(lines).direction(ListDirection::BottomToTop);
+
+                frame.render_stateful_widget(list, output_area, &mut list_state);
+                frame.render_widget(&cmd, input_area);
+                frame.set_cursor_position(cmd.cursor_position(area));
+            })?;
+
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    }) => break,
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Esc, ..
+                    }) => (),
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    }) => {
+                        let input = cmd.input;
+                        cmd.input = String::new();
+                        io_tx.blocking_send(input)?
+                    }
+                    Event::Key(event) if event.kind == KeyEventKind::Press => {
+                        cmd.on_key_press(event)
+                    }
+                    Event::Key(input) => todo!("Key event"),
+                    Event::FocusGained => todo!("FocusGained event"),
+                    Event::FocusLost => todo!("FocusLost event"),
+                    // TODO: handle text selection and mouse scroll
+                    Event::Mouse(event) => {}
+                    Event::Paste(input) => todo!("Paste event"),
+                    Event::Resize(_columns, _rows) => {}
+                }
+            }
+
+            match network_rx.try_recv() {
+                Ok(resp) => responses.push(resp),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err(Error::DisconnectedNetworkChannel);
+                }
+            }
         }
+
+        // TODO: ensure we are calling these when an error occurs
+        std::io::stdout().execute(event::DisableMouseCapture)?;
+        ratatui::restore();
+
+        Ok(())
     });
 
     let args: Vec<String> = env::args().collect();
@@ -94,7 +235,7 @@ async fn network_loop(
     let client = reqwest::Client::new();
 
     loop {
-        let input = io_rx.recv().await;
+        let input = io_rx.recv().await.ok_or(Error::DisconnectedIOChannel)?;
 
         let req = MoonrakerRPC {
             jsonrpc: "2.0",
